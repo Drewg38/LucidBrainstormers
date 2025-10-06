@@ -1,10 +1,24 @@
-/* mini-brainstormer-app.js — single reusable script for all 3-reel generators */
+/* mini-brainstormer-app.js — reusable script (with baked-in defaults)
+   Defaults point to LucidBrainstormers commit d38fd6e…
+   You can still override via query params: ?src1=...&src2=...&src3=...&l1=...&l2=...&l3=...
+*/
 (function(){
   'use strict';
 
   const $  = (s, r=document) => r.querySelector(s);
   const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
   const esc = s => String(s ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  // ----- DEFAULT SOURCES (user's GitHub commit) -----
+  const COMMIT = 'd38fd6ee3b954986a28eca30598b3655595bc915';
+  const RAW = (path)=>`https://raw.githubusercontent.com/Drewg38/LucidBrainstormers/${COMMIT}/${path}`;
+
+  const DEFAULT_LABELS = ['Activities','Locations','Thoughts'];
+  const DEFAULT_URLS = [
+    RAW('artist_excursion_activities.js'),
+    RAW('artist_excursion_locations.js'),
+    RAW('artist_excursion_thoughts.js')
+  ];
 
   const root    = $('#mini-root');               // page root
   const status  = $('#status');                  // status line
@@ -15,47 +29,87 @@
   const qp = (k,d='') => params.get(k) ?? d;
 
   const labels = [
-    qp('l1', $('#label1')?.dataset?.default || $('#label1')?.textContent || 'Reel 1'),
-    qp('l2', $('#label2')?.dataset?.default || $('#label2')?.textContent || 'Reel 2'),
-    qp('l3', $('#label3')?.dataset?.default || $('#label3')?.textContent || 'Reel 3'),
+    qp('l1', $('#label1')?.dataset?.default || $('#label1')?.textContent || DEFAULT_LABELS[0]),
+    qp('l2', $('#label2')?.dataset?.default || $('#label2')?.textContent || DEFAULT_LABELS[1]),
+    qp('l3', $('#label3')?.dataset?.default || $('#label3')?.textContent || DEFAULT_LABELS[2]),
   ];
   if ($('#label1')) $('#label1').textContent = labels[0];
   if ($('#label2')) $('#label2').textContent = labels[1];
   if ($('#label3')) $('#label3').textContent = labels[2];
 
   const urls = [
-    qp('src1', $('#reel1')?.dataset?.src || ''),
-    qp('src2', $('#reel2')?.dataset?.src || ''),
-    qp('src3', $('#reel3')?.dataset?.src || '')
+    qp('src1', $('#reel1')?.dataset?.src || DEFAULT_URLS[0]),
+    qp('src2', $('#reel2')?.dataset?.src || DEFAULT_URLS[1]),
+    qp('src3', $('#reel3')?.dataset?.src || DEFAULT_URLS[2])
   ];
 
-  // --- JSON normalization
+  // --- JSON / JS normalization
   function getName(x){ return x?.name ?? x?.label ?? x?.value ?? (typeof x === 'string' ? x : String(x ?? '')); }
   function getDesc(x){ if (!x || typeof x !== 'object') return ''; return x.desc ?? x.description ?? x.details ?? x.detail ?? x.text ?? ''; }
   function normalizeList(raw){
-    if (Array.isArray(raw))           return raw.map(x => ({ name:getName(x), desc:getDesc(x) }));
+    if (Array.isArray(raw))              return raw.map(x => ({ name:getName(x), desc:getDesc(x) }));
     if (raw && Array.isArray(raw.items)) return raw.items.map(x => ({ name:getName(x), desc:getDesc(x) }));
     return [];
   }
 
-  function fetchJSON(u, ms=8000){
+  function fetchTEXT(u, ms=10000){
     return new Promise((resolve,reject)=>{
-      if (!u) return resolve([]);
+      if (!u) return resolve('[]');
       const t = setTimeout(()=>reject(new Error('timeout')), ms);
-      fetch(u, {mode:'cors', cache:'no-cache'}).then(r=>{
+      fetch(u, {mode:'cors', cache:'no-cache', redirect:'follow'}).then(r=>{
         if(!r.ok) throw new Error('HTTP '+r.status);
         return r.text();
-      }).then(txt=>{
-        clearTimeout(t);
-        if (txt.trim().startsWith('<')) throw new Error('HTML not JSON');
-        resolve(JSON.parse(txt));
-      }).catch(e=>{ clearTimeout(t); reject(e); });
+      }).then(txt=>{ clearTimeout(t); resolve(txt); })
+        .catch(e=>{ clearTimeout(t); reject(e); });
     });
+  }
+
+  function tryParseJSON(txt){
+    try { return JSON.parse(txt); } catch(_){ return null; }
+  }
+
+  // Try to extract an array from a JS file (loose heuristic)
+  function tryParseArrayFromJS(txt){
+    // Common patterns: export default [...]; module.exports=[...]; const X=[...];
+    // 1) export default [...];
+    let m = txt.match(/export\s+default\s+(\[[\s\S]*?\])\s*;?/);
+    if (m) { try { return JSON.parse(m[1]); } catch(_){} }
+    // 2) module.exports = [...];
+    m = txt.match(/module\.exports\s*=\s*(\[[\s\S]*?\])\s*;?/);
+    if (m) { try { return JSON.parse(m[1]); } catch(_){} }
+    // 3) window.X = [...]; or globalThis.X = [...];
+    m = txt.match(/=\s*(\[[\s\S]*?\])\s*;?/);
+    if (m) { try { return JSON.parse(m[1]); } catch(_){} }
+    // 4) If the whole file is an array literal
+    const trimmed = txt.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')){
+      try { return JSON.parse(trimmed); } catch(_){}
+    }
+    // 5) Last resort: eval in a very restricted Function and return module.exports/exports.default
+    try{
+      const fn = new Function('"use strict";var window={};var self={};var globalThis={};var exports={};var module={exports:{}};'+txt+';return (module.exports && module.exports.default) || module.exports || exports.default || null;');
+      const out = fn();
+      if (Array.isArray(out)) return out;
+    }catch(_){}
+    return null;
+  }
+
+  async function loadList(u){
+    const txt = await fetchTEXT(u);
+    // First try JSON
+    const js = tryParseJSON(txt);
+    if (js) return normalizeList(js);
+    // Then try JS array extraction
+    const arr = tryParseArrayFromJS(txt);
+    if (arr) return normalizeList(arr);
+    // else: return empty
+    return [];
   }
 
   // --- 3-row window
   function windowed(list, center, size=3){
     const half = Math.floor(size/2), out=[];
+    if (!list.length){ return [{name:'—'},{name:'—'},{name:'—'}]; }
     for (let i=center-half;i<=center+half;i++){
       const idx = ((i%list.length)+list.length)%list.length;
       out.push(list[idx]);
@@ -199,8 +253,8 @@
   async function start(){
     try{
       setStatus('Loading lists…');
-      const lists = await Promise.all(urls.map(u => fetchJSON(u).catch(()=>[])));
-      const items = lists.map(js => normalizeList(js));
+      const lists = await Promise.all(urls.map(u => loadList(u).catch(()=>[])));
+      const items = lists.map(js => js);
       setStatus('');
 
       // Build reels
