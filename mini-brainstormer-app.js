@@ -1,12 +1,11 @@
 /* mini-brainstormer-app.js — reusable script (with baked-in defaults)
    Defaults point to LucidBrainstormers commit d38fd6e…
-   You can still override via query params: ?src1=...&src2=...&src3=...&l1=...&l2=...&l3=...
+   Robust loader: JSON -> JS array parse -> dynamic module import via Blob (handles `export default`)
 */
 (function(){
   'use strict';
 
   const $  = (s, r=document) => r.querySelector(s);
-  const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
   const esc = s => String(s ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
   // ----- DEFAULT SOURCES (user's GitHub commit) -----
@@ -20,8 +19,8 @@
     RAW('artist_excursion_thoughts.js')
   ];
 
-  const root    = $('#mini-root');               // page root
-  const status  = $('#status');                  // status line
+  const root    = $('#mini-root');
+  const status  = $('#status');
   const setStatus = (m)=>{ if(status) status.textContent = m || ''; };
 
   // --- Config from query params or data-* fallbacks
@@ -44,65 +43,69 @@
   ];
 
   // --- JSON / JS normalization
-  function getName(x){ return x?.name ?? x?.label ?? x?.value ?? (typeof x === 'string' ? x : String(x ?? '')); }
-  function getDesc(x){ if (!x || typeof x !== 'object') return ''; return x.desc ?? x.description ?? x.details ?? x.detail ?? x.text ?? ''; }
-  function normalizeList(raw){
+  const getName = (x)=> x?.name ?? x?.label ?? x?.value ?? (typeof x === 'string' ? x : String(x ?? ''));
+  const getDesc = (x)=> (!x || typeof x !== 'object') ? '' : (x.desc ?? x.description ?? x.details ?? x.detail ?? x.text ?? '');
+  const normalizeList = (raw)=> {
     if (Array.isArray(raw))              return raw.map(x => ({ name:getName(x), desc:getDesc(x) }));
     if (raw && Array.isArray(raw.items)) return raw.items.map(x => ({ name:getName(x), desc:getDesc(x) }));
     return [];
-  }
+  };
 
-  function fetchTEXT(u, ms=10000){
-    return new Promise((resolve,reject)=>{
-      if (!u) return resolve('[]');
-      const t = setTimeout(()=>reject(new Error('timeout')), ms);
-      fetch(u, {mode:'cors', cache:'no-cache', redirect:'follow'}).then(r=>{
-        if(!r.ok) throw new Error('HTTP '+r.status);
-        return r.text();
-      }).then(txt=>{ clearTimeout(t); resolve(txt); })
-        .catch(e=>{ clearTimeout(t); reject(e); });
-    });
-  }
+  const fetchTEXT = (u, ms=10000)=> new Promise((resolve,reject)=>{
+    if (!u) return resolve('[]');
+    const t = setTimeout(()=>reject(new Error('timeout')), ms);
+    fetch(u, {mode:'cors', cache:'no-cache', redirect:'follow'}).then(r=>{
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      return r.text();
+    }).then(txt=>{ clearTimeout(t); resolve(txt); })
+      .catch(e=>{ clearTimeout(t); reject(e); });
+  });
 
-  function tryParseJSON(txt){
-    try { return JSON.parse(txt); } catch(_){ return null; }
-  }
+  const tryParseJSON = (txt)=> { try { return JSON.parse(txt); } catch(_){ return null; } };
 
-  // Try to extract an array from a JS file (loose heuristic)
-  function tryParseArrayFromJS(txt){
-    // Common patterns: export default [...]; module.exports=[...]; const X=[...];
-    // 1) export default [...];
-    let m = txt.match(/export\s+default\s+(\[[\s\S]*?\])\s*;?/);
-    if (m) { try { return JSON.parse(m[1]); } catch(_){} }
-    // 2) module.exports = [...];
-    m = txt.match(/module\.exports\s*=\s*(\[[\s\S]*?\])\s*;?/);
-    if (m) { try { return JSON.parse(m[1]); } catch(_){} }
-    // 3) window.X = [...]; or globalThis.X = [...];
-    m = txt.match(/=\s*(\[[\s\S]*?\])\s*;?/);
-    if (m) { try { return JSON.parse(m[1]); } catch(_){} }
-    // 4) If the whole file is an array literal
-    const trimmed = txt.trim();
-    if (trimmed.startsWith('[') && trimmed.endsWith(']')){
-      try { return JSON.parse(trimmed); } catch(_){}
+  // Extract a JS array literal if present
+  function tryParseArrayLiteral(txt){
+    // Look for the first top-level [ ... ] (naive but works for data files)
+    const start = txt.indexOf('[');
+    const end   = txt.lastIndexOf(']');
+    if (start !== -1 && end !== -1 && end > start){
+      const slice = txt.slice(start, end+1);
+      try { return JSON.parse(slice); } catch(_) {}
     }
-    // 5) Last resort: eval in a very restricted Function and return module.exports/exports.default
-    try{
-      const fn = new Function('"use strict";var window={};var self={};var globalThis={};var exports={};var module={exports:{}};'+txt+';return (module.exports && module.exports.default) || module.exports || exports.default || null;');
-      const out = fn();
-      if (Array.isArray(out)) return out;
-    }catch(_){}
     return null;
+  }
+
+  // Dynamic import via Blob (handles `export default` or module.exports)
+  async function importModuleFromText(txt){
+    const blob = new Blob([txt], {type:'text/javascript'});
+    const url  = URL.createObjectURL(blob);
+    try{
+      const mod = await import(/* @vite-ignore */ url);
+      return mod?.default ?? mod?.exports ?? null;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
   }
 
   async function loadList(u){
     const txt = await fetchTEXT(u);
-    // First try JSON
-    const js = tryParseJSON(txt);
-    if (js) return normalizeList(js);
-    // Then try JS array extraction
-    const arr = tryParseArrayFromJS(txt);
-    if (arr) return normalizeList(arr);
-    // else: return empty
+    // JSON straight
+    const asJSON = tryParseJSON(txt);
+    if (asJSON) return normalizeList(asJSON);
+    // array literal contained in JS
+    const arrLit = tryParseArrayLiteral(txt);
+    if (arrLit) return normalizeList(arrLit);
+    // dynamic module import (ESM/CommonJS)
+    try{
+      const modVal = await importModuleFromText(txt);
+      if (Array.isArray(modVal)) return normalizeList(modVal);
+      // maybe module exports an object with a property that is array
+      if (modVal && typeof modVal === 'object'){
+        for (const k of Object.keys(modVal)){
+          if (Array.isArray(modVal[k])) return normalizeList(modVal[k]);
+        }
+      }
+    }catch(_){}
     return [];
   }
 
